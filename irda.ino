@@ -3,12 +3,14 @@
 const uint32_t cyclesPerBit = SystemCoreClock / 9756;
 const unsigned irdaPort = PA0;
 const uint16_t portLevel = 1700;
+unsigned position = 0;
 
 #define BUFFER_SIZE 0x100 // power of 2
 #define BUFFER_SIZE_MASK (BUFFER_SIZE-1)
 unsigned int bufferHead = 0;
 unsigned int bufferTail = 0;
-uint8 buffer[256];
+uint8 buffer[BUFFER_SIZE];
+uint8 currentKey[3];
 
 void irdaInit(void) {
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
@@ -16,32 +18,8 @@ void irdaInit(void) {
   pinMode(irdaPort, INPUT_ANALOG);
 }
 
-inline uint8 readByte() {
-  DWT->CYCCNT = 0;
-  nvic_globalirq_disable();
-  uint8 datum = 0;
-  uint32 next = cyclesPerBit + cyclesPerBit/16;
-  for (int i=0; i<9; i++) {
-    while(DWT->CYCCNT < next);
-    uint32 next1 = next + cyclesPerBit/16;
-    if (i<8)
-      while(DWT->CYCCNT < next1) {
-        if (analogRead(irdaPort) >= portLevel) {
-          datum |= (1 << i);
-          break;
-        }
-      }
-    next += cyclesPerBit;
-  }
-  next += cyclesPerBit / 32;
-  while(DWT->CYCCNT < next);
-  while(analogRead(irdaPort) >= portLevel);
-  nvic_globalirq_enable();
-  return datum^0xFF;
-}
-
-inline bool plus() {
-  uint32 next = DWT->CYCCNT + cyclesPerBit/2;
+inline bool plus(uint32 length) {
+  uint32 next = DWT->CYCCNT + length;
   while(DWT->CYCCNT < next) {
     if (analogRead(irdaPort) >= portLevel)
       return true;
@@ -53,13 +31,14 @@ inline unsigned readData() {
   unsigned bytesRead = 0;
   DWT->CYCCNT = 0;
   nvic_globalirq_disable();
-  while(plus()) {
+  while(plus(cyclesPerBit*2)) {
+    DWT->CYCCNT = 0;
     uint8 datum = 0;
     uint32 next = cyclesPerBit;
     for (int i=0; i<9; i++) {
       while(DWT->CYCCNT < next);
       next += cyclesPerBit;
-      if (i<8 && plus()) 
+      if (i<8 && plus(cyclesPerBit/2)) 
          datum |= (1 << i);
     }
     while(DWT->CYCCNT < next);
@@ -82,17 +61,62 @@ void setup() {
   digitalWrite(PB12,1);
 }
 
+inline void processKey(uint8 key) {
+  Serial.println(key,HEX);
+}
+
+inline void processChar() {
+  uint8 datum = buffer[bufferTail];
+  bufferTail = (bufferTail + 1) & BUFFER_SIZE_MASK; 
+  if (datum == 0xFF) {
+    position = 1;
+  }
+  else if (position == 1) {
+    if (datum == 0xC0) {
+      position++;
+    }
+    else {
+      position = 0;
+    }    
+  }
+  else if (position == 2) {
+    currentKey[0] = datum;
+    position++;
+  }
+  else if (position == 3) {
+    currentKey[1] = datum^0xFF;
+    position++;
+  }
+  else if (position == 4) {
+    currentKey[2] = datum^0xFF;
+    position++;
+  }
+  else if (position == 5) {
+    if (datum == 0xC1) {
+      uint8 key;
+      if (currentKey[0] == currentKey[1] || currentKey[0] == currentKey[2]) {
+        key = currentKey[0];
+      }
+      else if (currentKey[1] == currentKey[2]) {
+        key = currentKey[1];
+      }
+      processKey(key);
+      position = 0;
+    }
+  }
+}
+
+uint32 lastKeyTime = 0;
+
 void loop() {
   if (analogRead(irdaPort) >= portLevel) {
-    unsigned n = readData();
-    if(1<n) Serial.println("hurrah"+String(n));
-    if (inBuffer()>=20) {
-      while(bufferHead != bufferTail) {
-        Serial.println(buffer[bufferTail],HEX);
-        bufferTail = (bufferTail+1)&BUFFER_SIZE_MASK;
-      }
-    }
-  } 
-//  Serial.println(String(DWT->CYCCNT)+","+String(analogRead(irdaPort)));
+    lastKeyTime = millis();
+    readData();
+  }
+  else {
+    if (millis() >= lastKeyTime+10 && bufferHead != bufferTail) 
+      processChar();
+  }
 }
+
 
